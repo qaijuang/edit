@@ -8,7 +8,7 @@ use std::{mem, vec};
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use edit::helpers::*;
-use edit::{buffer, hash, json, lsh, oklab, simd, unicode};
+use edit::{buffer, framebuffer, hash, json, lsh, oklab, simd, unicode};
 use stdext::arena::{self, scratch_arena};
 use stdext::collections::BVec;
 use stdext::float::parse_f64_approx;
@@ -136,6 +136,96 @@ fn bench_buffer(c: &mut Criterion) {
         .bench_function(BenchmarkId::new("TextBuffer", "rustcode"), |b| {
             b.iter(bench_text_buffer);
         });
+}
+
+fn bench_buffer_render(c: &mut Criterion) {
+    const SIZE: Size = Size { width: 120, height: 40 };
+    let line_count = SIZE.height as usize;
+
+    let cases = [
+        (
+            "ascii",
+            "fn main() { let message = \"plain ASCII text\"; println!(\"{message}\"); }\n"
+                .repeat(line_count)
+                .into_bytes(),
+            false,
+            false,
+        ),
+        (
+            "unicode",
+            "月明かりが静かに照らし出す。 Ελληνικά العربية русский текст.\n"
+                .repeat(line_count)
+                .into_bytes(),
+            false,
+            false,
+        ),
+        (
+            "sparse_format_characters",
+            "let value = \"left\u{202e}right\"; // contains one warning character\n"
+                .repeat(line_count)
+                .into_bytes(),
+            false,
+            false,
+        ),
+        (
+            "wrapped_format_character",
+            format!(" {}\u{202e}\n", "a".repeat(SIZE.width as usize * 2))
+                .repeat(line_count)
+                .into_bytes(),
+            true,
+            false,
+        ),
+        (
+            "dense_format_characters",
+            "x\u{202e}\u{200b}\u{2060}\u{feff}\u{00a0}y\u{202e}\u{200b}\u{2060}\u{feff}\u{00a0}z\n"
+                .repeat(line_count)
+                .into_bytes(),
+            false,
+            false,
+        ),
+        (
+            "dense_malformed_utf8",
+            [b'a', 0xED, 0xA0, 0x80, b'b', b'\n'].repeat(line_count),
+            false,
+            false,
+        ),
+        (
+            "wrapped_tabs",
+            "\tThis line contains tabs and enough words to wrap across the configured viewport.\n"
+                .repeat(line_count)
+                .into_bytes(),
+            true,
+            false,
+        ),
+        (
+            "selected_whitespace",
+            "selected spaces and\ttabs preserve the existing rendering baseline\n"
+                .repeat(line_count)
+                .into_bytes(),
+            false,
+            true,
+        ),
+    ];
+
+    let mut group = c.benchmark_group("buffer::TextBuffer::render");
+    for (name, text, word_wrap, select_all) in cases {
+        let mut buf = buffer::TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.write_raw(&text);
+        buf.set_word_wrap(word_wrap);
+        buf.set_width(SIZE.width);
+        if select_all {
+            buf.select_all();
+        }
+
+        let mut fb = framebuffer::Framebuffer::new();
+        group.throughput(Throughput::Bytes(text.len() as u64)).bench_function(name, |b| {
+            b.iter(|| {
+                fb.flip(SIZE);
+                black_box(buf.render(Point::default(), SIZE.as_rect(), false, &mut fb))
+            })
+        });
+    }
 }
 
 fn bench_float(c: &mut Criterion) {
@@ -319,6 +409,7 @@ fn bench(c: &mut Criterion) {
     arena::init(128 * MEBI).unwrap();
 
     bench_buffer(c);
+    bench_buffer_render(c);
     bench_float(c);
     bench_glob(c);
     bench_hash(c);
