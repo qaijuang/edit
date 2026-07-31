@@ -573,6 +573,23 @@ impl Framebuffer {
         result
     }
 
+    #[cfg(test)]
+    pub(crate) fn back_line(&self, y: CoordType) -> Option<&str> {
+        let back = &self.buffers[self.frame_counter & 1];
+        back.text.lines.get(y as usize).map(String::as_str)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn back_cell_colors(&self, pos: Point) -> Option<(StraightRgba, StraightRgba)> {
+        let back = &self.buffers[self.frame_counter & 1];
+        if !back.bg_bitmap.size.as_rect().contains(pos) {
+            return None;
+        }
+
+        let index = (pos.y * back.bg_bitmap.size.width + pos.x) as usize;
+        Some((back.bg_bitmap.data[index], back.fg_bitmap.data[index]))
+    }
+
     fn format_color<'a>(
         &self,
         arena: &'a Arena,

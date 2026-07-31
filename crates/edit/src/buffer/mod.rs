@@ -3139,11 +3139,55 @@ fn detect_bom(bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::{SearchOptions, TextBuffer};
+    use crate::framebuffer::{Framebuffer, IndexedColor};
+    use crate::helpers::{Point, Size};
+    use crate::oklab::StraightRgba;
 
     fn buffer_contents(buf: &mut TextBuffer) -> String {
         let mut str = String::new();
         buf.save_as_string(&mut str);
         str
+    }
+
+    fn warning_colors(fb: &Framebuffer) -> (StraightRgba, StraightRgba) {
+        let bg = fb.indexed(IndexedColor::Yellow);
+        (bg, fb.contrasted(bg))
+    }
+
+    fn render(text: &str) -> (TextBuffer, Framebuffer) {
+        let size = Size { width: 32, height: 1 };
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.write_raw(text.as_bytes());
+
+        let mut fb = Framebuffer::new();
+        fb.flip(size);
+        buf.render(Point::default(), size.as_rect(), false, &mut fb).unwrap();
+
+        (buf, fb)
+    }
+
+    #[test]
+    fn render_warns_about_control_characters() {
+        let (_, fb) = render("a\u{0001}\u{007f}\u{0085}b");
+
+        assert!(fb.back_line(0).unwrap().starts_with("a\u{2401}\u{2421}\u{2426}b"));
+        for x in [1, 2, 3] {
+            assert_eq!(
+                fb.back_cell_colors(Point { x, y: 0 }),
+                Some(warning_colors(&fb)),
+                "column {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_preserves_unicode_format_characters() {
+        let text = "a\u{202e}b\u{200b}c\u{3000}d";
+        let (mut buf, fb) = render(text);
+
+        assert!(fb.back_line(0).unwrap().starts_with(text));
+        assert_eq!(buffer_contents(&mut buf), text);
     }
 
     #[test]
