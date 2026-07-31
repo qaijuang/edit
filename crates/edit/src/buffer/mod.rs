@@ -1951,29 +1951,55 @@ impl TextBuffer {
                     let chunk = self.read_forward(global_off);
                     let chunk = &chunk[..chunk.len().min(cursor_end.offset - global_off)];
                     let mut it = Utf8Chars::new(chunk, 0);
+                    let mut text_beg = 0;
 
-                    // TODO: Looping char-by-char is bad for performance.
-                    // >25% of the total rendering time is spent here.
                     loop {
                         let chunk_off = it.offset();
                         let global_off = global_off + chunk_off;
                         let Some(ch) = it.next() else {
                             break;
                         };
+                        let chunk_end = it.offset();
+
+                        if ch == char::REPLACEMENT_CHARACTER
+                            && &chunk[chunk_off..chunk_end] != "\u{fffd}".as_bytes()
+                        {
+                            // SAFETY: The decoder accepted every preceding byte in this run.
+                            unsafe {
+                                Self::render_push_str_unchecked(
+                                    &mut line,
+                                    &scratch,
+                                    &chunk[text_beg..chunk_off],
+                                )
+                            };
+                            line.push(&*scratch, ch);
+                            text_beg = chunk_end;
+                            continue;
+                        }
 
                         if ch == ' ' || ch == '\t' {
                             let is_tab = ch == '\t';
                             let visualize = selection_off.contains(&global_off);
+                            if !is_tab && !visualize {
+                                continue;
+                            }
+
+                            // SAFETY: The decoder accepted every byte in this run.
+                            unsafe {
+                                Self::render_push_str_unchecked(
+                                    &mut line,
+                                    &scratch,
+                                    &chunk[text_beg..chunk_off],
+                                )
+                            };
                             let mut whitespace = TAB_WHITESPACE;
                             let mut prefix_add = 0;
 
-                            if is_tab || visualize {
-                                // We need the character's visual position in order to either compute the tab size,
-                                // or set the foreground color of the visualizer, respectively.
-                                // TODO: Doing this char-by-char is of course also bad for performance.
-                                cursor_line =
-                                    self.cursor_move_to_offset_internal(cursor_line, global_off);
-                            }
+                            // The early continue above proves that this is a tab or selected space.
+                            // Both need the character's visual position.
+                            // TODO: Doing this char-by-char is of course also bad for performance.
+                            cursor_line =
+                                self.cursor_move_to_offset_internal(cursor_line, global_off);
 
                             let tab_size =
                                 if is_tab { self.tab_size_eval(cursor_line.column) } else { 1 };
@@ -2003,7 +2029,17 @@ impl TextBuffer {
                             }
 
                             line.push_str(&*scratch, &whitespace[..prefix_add + tab_size as usize]);
+                            text_beg = chunk_end;
                         } else if ch <= '\x1f' || ('\u{7f}'..='\u{9f}').contains(&ch) {
+                            // SAFETY: The decoder accepted every byte in this run.
+                            unsafe {
+                                Self::render_push_str_unchecked(
+                                    &mut line,
+                                    &scratch,
+                                    &chunk[text_beg..chunk_off],
+                                )
+                            };
+
                             // Append a Unicode representation of the C0 or C1 control character.
                             visualizer_buf[2] = if ch <= '\x1f' {
                                 0x80 | ch as u8 // U+2400..=U+241F
@@ -2032,9 +2068,13 @@ impl TextBuffer {
                             let fg = fb.contrasted(bg);
                             fb.blend_bg(visualizer_rect, bg);
                             fb.blend_fg(visualizer_rect, fg);
-                        } else {
-                            line.push(&*scratch, ch);
+                            text_beg = chunk_end;
                         }
+                    }
+
+                    // SAFETY: Invalid sequences were split from this run above.
+                    unsafe {
+                        Self::render_push_str_unchecked(&mut line, &scratch, &chunk[text_beg..]);
                     }
 
                     global_off += chunk.len();
@@ -2115,6 +2155,20 @@ impl TextBuffer {
         }
 
         Some(RenderResult { visual_pos_x_max })
+    }
+
+    /// Appends bytes that the render loop has already decoded as valid UTF-8.
+    ///
+    /// # Safety
+    ///
+    /// `bytes` must contain valid UTF-8.
+    #[inline]
+    unsafe fn render_push_str_unchecked<'a>(
+        line: &mut BString<'a>,
+        arena: &'a Arena,
+        bytes: &[u8],
+    ) {
+        line.push_str(arena, unsafe { str::from_utf8_unchecked(bytes) });
     }
 
     fn render_apply_highlights(
@@ -3154,17 +3208,21 @@ mod tests {
         (bg, fb.contrasted(bg))
     }
 
-    fn render(text: &str) -> (TextBuffer, Framebuffer) {
+    fn render_bytes(text: &[u8]) -> (TextBuffer, Framebuffer) {
         let size = Size { width: 32, height: 1 };
         let mut buf = TextBuffer::new(false).unwrap();
         buf.set_crlf(false);
-        buf.write_raw(text.as_bytes());
+        buf.write_raw(text);
 
         let mut fb = Framebuffer::new();
         fb.flip(size);
         buf.render(Point::default(), size.as_rect(), false, &mut fb).unwrap();
 
         (buf, fb)
+    }
+
+    fn render(text: &str) -> (TextBuffer, Framebuffer) {
+        render_bytes(text.as_bytes())
     }
 
     #[test]
@@ -3188,6 +3246,13 @@ mod tests {
 
         assert!(fb.back_line(0).unwrap().starts_with(text));
         assert_eq!(buffer_contents(&mut buf), text);
+    }
+
+    #[test]
+    fn render_replaces_invalid_utf8() {
+        let (_, fb) = render_bytes(&[b'a', 0xED, 0xA0, 0x80, b'b']);
+
+        assert!(fb.back_line(0).unwrap().starts_with("a\u{fffd}\u{fffd}\u{fffd}b"));
     }
 
     #[test]
