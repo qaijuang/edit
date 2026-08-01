@@ -1791,8 +1791,17 @@ impl TextBuffer {
         let height = destination.height();
         let line_number_width = self.margin_width.max(3) as usize - 3;
         let text_width = width - self.margin_width;
+        let visual_right = origin.x + text_width;
         let mut visualizer_buf = [0xE2, 0x90, 0x80]; // U+2400 in UTF8
         let mut visual_pos_x_max = 0;
+        let is_invalid_utf8 = |ch: char, bytes: &[u8]| {
+            ch == char::REPLACEMENT_CHARACTER && bytes != "\u{fffd}".as_bytes()
+        };
+        let is_warning = |ch: char, bytes: &[u8]| {
+            (!matches!(ch, '\t' | '\r' | '\n') && ch.is_control())
+                || unicode::is_non_control_warning(ch)
+                || is_invalid_utf8(ch, bytes)
+        };
 
         // Pick the cursor closer to the `origin.y`.
         let mut cursor = {
@@ -1818,7 +1827,7 @@ impl TextBuffer {
                 self.cursor_move_to_visual_internal(cursor, Point { x: origin.x, y: visual_line });
             let cursor_end = self.cursor_move_to_visual_internal(
                 cursor_beg,
-                Point { x: origin.x + text_width, y: visual_line },
+                Point { x: visual_right, y: visual_line },
             );
 
             // Accelerate the next render pass by remembering where we started off.
@@ -1908,7 +1917,7 @@ impl TextBuffer {
                 let rect = Rect {
                     left: left + selection_pos_beg.max(origin.x),
                     top,
-                    right: left + selection_pos_end.min(origin.x + text_width),
+                    right: left + selection_pos_end.min(visual_right),
                     bottom: top + 1,
                 };
 
@@ -1937,6 +1946,15 @@ impl TextBuffer {
                     );
 
                     if cursor_next.visual_pos.x > origin.x {
+                        if self.text_has(cursor_beg.offset..cursor_next.offset, is_warning) {
+                            self.render_mark_warning(
+                                origin,
+                                destination,
+                                cursor_beg,
+                                cursor_next,
+                                fb,
+                            );
+                        }
                         let overlap = cursor_next.visual_pos.x - origin.x;
                         debug_assert!((1..=7).contains(&overlap));
                         line.push_str(&*scratch, &TAB_WHITESPACE[..overlap as usize]);
@@ -1946,6 +1964,7 @@ impl TextBuffer {
 
                 let mut global_off = cursor_beg.offset;
                 let mut cursor_line = cursor_beg;
+                let mut warning_cursor = cursor_beg;
 
                 while global_off < cursor_end.offset {
                     let chunk = self.read_forward(global_off);
@@ -1960,10 +1979,9 @@ impl TextBuffer {
                             break;
                         };
                         let chunk_end = it.offset();
+                        let invalid_utf8 = is_invalid_utf8(ch, &chunk[chunk_off..chunk_end]);
 
-                        if ch == char::REPLACEMENT_CHARACTER
-                            && &chunk[chunk_off..chunk_end] != "\u{fffd}".as_bytes()
-                        {
+                        if invalid_utf8 {
                             // SAFETY: The decoder accepted every preceding byte in this run.
                             unsafe {
                                 Self::render_push_str_unchecked(
@@ -1973,6 +1991,17 @@ impl TextBuffer {
                                 )
                             };
                             line.push(&*scratch, ch);
+
+                            let warning_end = self.render_mark_invalid_utf8(
+                                cursor_line,
+                                global_off,
+                                origin,
+                                destination,
+                                fb,
+                            );
+                            // We reuse this measured end for later offset conversions and warning scans.
+                            cursor_line = warning_end;
+                            warning_cursor = warning_end;
                             text_beg = chunk_end;
                             continue;
                         }
@@ -2030,7 +2059,7 @@ impl TextBuffer {
 
                             line.push_str(&*scratch, &whitespace[..prefix_add + tab_size as usize]);
                             text_beg = chunk_end;
-                        } else if ch <= '\x1f' || ('\u{7f}'..='\u{9f}').contains(&ch) {
+                        } else if ch.is_control() {
                             // SAFETY: The decoder accepted every byte in this run.
                             unsafe {
                                 Self::render_push_str_unchecked(
@@ -2053,22 +2082,78 @@ impl TextBuffer {
                             line.push_str(&*scratch, unsafe {
                                 str::from_utf8_unchecked(&visualizer_buf)
                             });
-
-                            // Highlight the control character yellow.
-                            cursor_line =
+                            let warning_beg =
                                 self.cursor_move_to_offset_internal(cursor_line, global_off);
-                            let visualizer_rect = {
-                                let left =
-                                    destination.left + self.margin_width + cursor_line.visual_pos.x
-                                        - origin.x;
-                                let top = destination.top + cursor_line.visual_pos.y - origin.y;
-                                Rect { left, top, right: left + 1, bottom: top + 1 }
-                            };
-                            let bg = fb.indexed(IndexedColor::Yellow);
-                            let fg = fb.contrasted(bg);
-                            fb.blend_bg(visualizer_rect, bg);
-                            fb.blend_fg(visualizer_rect, fg);
+                            let warning_end = self.cursor_move_to_logical_internal(
+                                warning_beg,
+                                Point {
+                                    x: warning_beg.logical_pos.x + 1,
+                                    y: warning_beg.logical_pos.y,
+                                },
+                            );
+                            self.render_mark_warning(
+                                origin,
+                                destination,
+                                warning_beg,
+                                warning_end,
+                                fb,
+                            );
+                            // We reuse this measured end for later offset conversions and warning scans.
+                            cursor_line = warning_end;
+                            warning_cursor = warning_end;
                             text_beg = chunk_end;
+                        } else if global_off >= warning_cursor.offset
+                            && unicode::is_non_control_warning(ch)
+                        {
+                            // > Measure positions only after finding a warning, so
+                            // we can preserve the single-pass fast path for warning-free text.
+                            // > Skip complete one-column ASCII graphemes without another Unicode lookup.
+                            // > Keep the last byte so measurement can join the warning to the
+                            // preceding grapheme.
+                            let mut scan_offset = warning_cursor.offset;
+                            'ascii: while scan_offset < global_off {
+                                let chunk = self.read_forward(scan_offset);
+                                let chunk = &chunk[..chunk.len().min(global_off - scan_offset)];
+                                for &byte in chunk {
+                                    if !byte.is_ascii() || matches!(byte, b'\t' | b'\r' | b'\n') {
+                                        break 'ascii;
+                                    }
+                                    scan_offset += 1;
+                                }
+                            }
+                            let ascii_end =
+                                scan_offset.saturating_sub(1).max(warning_cursor.offset);
+                            let ascii_width = (ascii_end - warning_cursor.offset) as CoordType;
+                            warning_cursor.offset = ascii_end;
+                            warning_cursor.logical_pos.x += ascii_width;
+                            warning_cursor.visual_pos.x += ascii_width;
+                            warning_cursor.column += ascii_width;
+
+                            // This range stays on one resolved visual line. We disable wrapping so the
+                            // cursor cannot repeat word-wrap lookahead while finding the warning.
+                            let mut warning_measurement = self
+                                .measurement_config()
+                                .with_cursor(warning_cursor)
+                                .with_word_wrap_column(0);
+                            let warning_beg = loop {
+                                let warning_beg = warning_measurement.cursor();
+                                let warning_end = warning_measurement.goto_logical(Point {
+                                    x: warning_beg.logical_pos.x + 1,
+                                    y: warning_beg.logical_pos.y,
+                                });
+                                debug_assert!(warning_end.offset > warning_beg.offset);
+                                if global_off < warning_end.offset {
+                                    break warning_beg;
+                                }
+                            };
+                            warning_cursor = warning_measurement.cursor();
+                            self.render_mark_warning(
+                                origin,
+                                destination,
+                                warning_beg,
+                                warning_cursor,
+                                fb,
+                            );
                         }
                     }
 
@@ -2081,6 +2166,31 @@ impl TextBuffer {
                 }
 
                 visual_pos_x_max = visual_pos_x_max.max(cursor_end.visual_pos.x);
+            }
+
+            // > Measurement limits non-tab graphemes to two columns, and tabs are not warnings.
+            // > A warning can overlap the right edge only from the edge or one column before it.
+            if cursor_end.visual_pos.y == visual_line
+                && cursor_end.visual_pos.x >= visual_right - 1
+                && cursor_end.visual_pos.x <= visual_right
+            {
+                let cursor_next = self.cursor_move_to_logical_internal(
+                    cursor_end,
+                    Point { x: cursor_end.logical_pos.x + 1, y: cursor_end.logical_pos.y },
+                );
+                if cursor_next.offset > cursor_end.offset {
+                    let width = cursor_next.column.saturating_sub(cursor_end.column);
+                    let clips_right = cursor_end.visual_pos.x < visual_right
+                        && cursor_next.visual_pos.x > visual_right;
+                    let anchors_at_right = cursor_end.visual_pos.x == visual_right
+                        && width == 0
+                        && cursor_next.visual_pos.y == visual_line;
+                    if (clips_right || anchors_at_right)
+                        && self.text_has(cursor_end.offset..cursor_next.offset, is_warning)
+                    {
+                        self.render_mark_warning(origin, destination, cursor_end, cursor_next, fb);
+                    }
+                }
             }
 
             fb.replace_text(destination.top + y, destination.left, destination.right, &line);
@@ -2154,6 +2264,9 @@ impl TextBuffer {
             }
         }
 
+        // Finally, apply warning colors last so syntax, selection, ruler, and line colors cannot hide them.
+        fb.apply_warning_colors();
+
         Some(RenderResult { visual_pos_x_max })
     }
 
@@ -2169,6 +2282,106 @@ impl TextBuffer {
         bytes: &[u8],
     ) {
         line.push_str(arena, unsafe { str::from_utf8_unchecked(bytes) });
+    }
+
+    #[cold]
+    fn render_mark_invalid_utf8(
+        &self,
+        cursor: Cursor,
+        offset: usize,
+        origin: Point,
+        destination: Rect,
+        fb: &mut Framebuffer,
+    ) -> Cursor {
+        let warning_beg = self.cursor_move_to_offset_internal(cursor, offset);
+        let (warning_beg, warning_end) = if warning_beg.offset != offset {
+            // Moving to an interior byte rounds to the grapheme's end. We move back once to recover
+            // the start without measuring it again.
+            debug_assert!(warning_beg.logical_pos.x > 0);
+            let warning_end = warning_beg;
+            let warning_beg = self.cursor_move_to_logical_internal(
+                warning_end,
+                Point { x: warning_end.logical_pos.x - 1, y: warning_end.logical_pos.y },
+            );
+            debug_assert!(warning_beg.offset <= offset);
+            (warning_beg, warning_end)
+        } else {
+            let warning_end = self.cursor_move_to_logical_internal(
+                warning_beg,
+                Point { x: warning_beg.logical_pos.x + 1, y: warning_beg.logical_pos.y },
+            );
+            (warning_beg, warning_end)
+        };
+        self.render_mark_warning(origin, destination, warning_beg, warning_end, fb);
+        warning_end
+    }
+
+    fn render_mark_warning(
+        &self,
+        origin: Point,
+        destination: Rect,
+        cluster_beg: Cursor,
+        cluster_end: Cursor,
+        fb: &mut Framebuffer,
+    ) {
+        let text_left = destination.left + self.margin_width;
+        let text_right = destination.right;
+        if text_left >= text_right {
+            return;
+        }
+
+        let visual_right = origin.x + text_right - text_left;
+        let width = cluster_end.column.saturating_sub(cluster_beg.column);
+        let screen_y = destination.top + cluster_beg.visual_pos.y - origin.y;
+        let (left, right) = if width == 0 {
+            // A zero-width grapheme has no cell, so we anchor it to the nearest visible cell.
+            let left = cluster_beg.visual_pos.x.clamp(origin.x, visual_right - 1);
+            (left, left + 1)
+        } else {
+            (
+                cluster_beg.visual_pos.x.max(origin.x),
+                (cluster_beg.visual_pos.x + width).min(visual_right),
+            )
+        };
+
+        if (destination.top..destination.bottom).contains(&screen_y) && left < right {
+            let left = text_left + left - origin.x;
+            fb.mark_warning(Rect {
+                left,
+                top: screen_y,
+                right: text_left + right - origin.x,
+                bottom: screen_y + 1,
+            });
+        }
+    }
+
+    fn text_has(
+        &self,
+        range: Range<usize>,
+        mut predicate: impl FnMut(char, &[u8]) -> bool,
+    ) -> bool {
+        // Cursor calculations bound both ranges to stored text. `read_forward` therefore returns
+        // a nonempty chunk until `offset` reaches `range.end`.
+        debug_assert!(range.start <= range.end && range.end <= self.text_length());
+        let mut offset = range.start;
+        while offset < range.end {
+            let chunk = self.read_forward(offset);
+            let chunk = &chunk[..chunk.len().min(range.end - offset)];
+            let mut chars = Utf8Chars::new(chunk, 0);
+            // We reuse this decode's byte span so predicates can identify malformed UTF-8
+            // without scanning the range again.
+            loop {
+                let char_beg = chars.offset();
+                let Some(ch) = chars.next() else {
+                    break;
+                };
+                if predicate(ch, &chunk[char_beg..chars.offset()]) {
+                    return true;
+                }
+            }
+            offset += chunk.len();
+        }
+        false
     }
 
     fn render_apply_highlights(
@@ -3203,6 +3416,13 @@ mod tests {
         str
     }
 
+    fn text_buffer(text: &[u8]) -> TextBuffer {
+        let mut buf = TextBuffer::new(false).unwrap();
+        buf.set_crlf(false);
+        buf.write_raw(text);
+        buf
+    }
+
     fn warning_colors(fb: &Framebuffer) -> (StraightRgba, StraightRgba) {
         let bg = fb.indexed(IndexedColor::Yellow);
         (bg, fb.contrasted(bg))
@@ -3210,15 +3430,28 @@ mod tests {
 
     fn render_bytes(text: &[u8]) -> (TextBuffer, Framebuffer) {
         let size = Size { width: 32, height: 1 };
-        let mut buf = TextBuffer::new(false).unwrap();
-        buf.set_crlf(false);
-        buf.write_raw(text);
+        let mut buf = text_buffer(text);
 
-        let mut fb = Framebuffer::new();
-        fb.flip(size);
-        buf.render(Point::default(), size.as_rect(), false, &mut fb).unwrap();
+        let fb = render_buffer(&mut buf, size, false);
 
         (buf, fb)
+    }
+
+    fn render_buffer(buf: &mut TextBuffer, size: Size, focused: bool) -> Framebuffer {
+        render_buffer_at(buf, size, Point::default(), focused)
+    }
+
+    fn render_buffer_at(
+        buf: &mut TextBuffer,
+        size: Size,
+        origin: Point,
+        focused: bool,
+    ) -> Framebuffer {
+        let mut fb = Framebuffer::new();
+        fb.flip(size);
+        buf.render(origin, size.as_rect(), focused, &mut fb).unwrap();
+
+        fb
     }
 
     fn render(text: &str) -> (TextBuffer, Framebuffer) {
@@ -3249,10 +3482,175 @@ mod tests {
     }
 
     #[test]
-    fn render_replaces_invalid_utf8() {
-        let (_, fb) = render_bytes(&[b'a', 0xED, 0xA0, 0x80, b'b']);
+    fn render_colors_unicode_warning_cells() {
+        let (_, fb) = render("\u{202e}a b\u{200b}c\u{a0}d\u{3000}e");
 
-        assert!(fb.back_line(0).unwrap().starts_with("a\u{fffd}\u{fffd}\u{fffd}b"));
+        for x in [0, 2, 4, 6, 7] {
+            assert_eq!(
+                fb.back_cell_colors(Point { x, y: 0 }),
+                Some(warning_colors(&fb)),
+                "column {x}"
+            );
+        }
+        for x in [1, 3, 5, 8] {
+            assert_ne!(
+                fb.back_cell_colors(Point { x, y: 0 }),
+                Some(warning_colors(&fb)),
+                "column {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_colors_warning_grapheme_across_buffer_chunks() {
+        let size = Size { width: 2, height: 1 };
+        let mut buf = text_buffer("\u{202e}".as_bytes());
+        buf.cursor_move_to_offset(0);
+        buf.write_raw(b"a");
+
+        let fb = render_buffer(&mut buf, size, false);
+        assert!(fb.back_line(0).unwrap().starts_with("a\u{202e}"));
+        assert_eq!(fb.back_cell_colors(Point::default()), Some(warning_colors(&fb)));
+        assert_ne!(fb.back_cell_colors(Point { x: 1, y: 0 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_warning_colors_override_selection_and_ruler() {
+        let size = Size { width: 32, height: 1 };
+        let mut buf = text_buffer("a\u{a0}b".as_bytes());
+        buf.select_all();
+        buf.set_ruler(1);
+
+        let fb = render_buffer(&mut buf, size, false);
+        assert_eq!(fb.back_cell_colors(Point { x: 1, y: 0 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_warning_colors_override_syntax_attributes() {
+        let size = Size { width: 32, height: 1 };
+        let mut buf = text_buffer("**a\u{202e}b**".as_bytes());
+        let markdown = crate::lsh::LANGUAGES.iter().find(|language| language.id == "markdown");
+        buf.set_language(markdown);
+
+        let fb = render_buffer(&mut buf, size, false);
+        assert_eq!(fb.back_cell_colors(Point { x: 2, y: 0 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_warning_colors_override_current_line_with_margin() {
+        let size = Size { width: 8, height: 1 };
+        let mut buf = text_buffer("a\u{a0}b".as_bytes());
+        buf.set_margin_enabled(true);
+        buf.set_width(size.width);
+        buf.set_line_highlight_enabled(true);
+
+        let fb = render_buffer(&mut buf, size, true);
+        let warning_x = buf.margin_width() + 1;
+        assert_eq!(fb.back_cell_colors(Point { x: warning_x, y: 0 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_colors_clipped_unicode_warnings() {
+        let size = Size { width: 1, height: 1 };
+        let mut split_grapheme = text_buffer("\u{fe0f}\u{202e}x".as_bytes());
+        split_grapheme.cursor_move_to_offset(0);
+        split_grapheme.write_raw(b"#");
+
+        for (case, mut buf) in [
+            ("wide whitespace", text_buffer("\u{3000}x".as_bytes())),
+            ("split grapheme", split_grapheme),
+        ] {
+            for x in 0..=1 {
+                let fb = render_buffer_at(&mut buf, size, Point { x, y: 0 }, false);
+                assert_eq!(
+                    fb.back_cell_colors(Point::default()),
+                    Some(warning_colors(&fb)),
+                    "{case} at origin {x}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_preserves_contextual_format_characters() {
+        let text = "a\u{ad}\u{200c}\u{200d}\u{2061}\u{fe0f}\u{e007f}b";
+        let (_, fb) = render(text);
+
+        assert!(fb.back_line(0).unwrap().starts_with(text));
+    }
+
+    #[test]
+    fn render_colors_wrapped_unicode_whitespace() {
+        let size = Size { width: 4, height: 2 };
+        let mut buf = text_buffer("abc\u{3000}d".as_bytes());
+        buf.set_word_wrap(true);
+        buf.set_width(size.width);
+
+        let fb = render_buffer(&mut buf, size, false);
+        assert!(fb.back_line(0).unwrap().starts_with("abc "));
+        assert!(fb.back_line(1).unwrap().starts_with("\u{3000}d"));
+        for x in [0, 1] {
+            assert_eq!(
+                fb.back_cell_colors(Point { x, y: 1 }),
+                Some(warning_colors(&fb)),
+                "column {x}"
+            );
+        }
+    }
+
+    #[test]
+    fn render_colors_zero_width_warning_after_wrap() {
+        let size = Size { width: 2, height: 2 };
+        let mut buf = text_buffer("a b\u{202e}".as_bytes());
+        buf.set_word_wrap(true);
+        buf.set_width(size.width);
+
+        let fb = render_buffer(&mut buf, size, false);
+        assert_eq!(fb.back_cell_colors(Point { x: 0, y: 1 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_does_not_color_hidden_warnings() {
+        let size = Size { width: 1, height: 2 };
+        let mut buf = text_buffer("aX\u{202e}\n\u{a0}".as_bytes());
+
+        let fb = render_buffer(&mut buf, size, false);
+        assert_ne!(fb.back_cell_colors(Point { x: 0, y: 0 }), Some(warning_colors(&fb)));
+        assert_eq!(fb.back_cell_colors(Point { x: 0, y: 1 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_warns_about_invalid_utf8() {
+        let (_, fb) = render_bytes(&[b'a', 0xED, 0xA0, 0x80, b'b', 0xEF, 0xBF, 0xBD]);
+
+        assert!(fb.back_line(0).unwrap().starts_with("a\u{fffd}\u{fffd}\u{fffd}b\u{fffd}"));
+        for x in [1, 2, 3] {
+            assert_eq!(
+                fb.back_cell_colors(Point { x, y: 0 }),
+                Some(warning_colors(&fb)),
+                "column {x}"
+            );
+        }
+        assert_ne!(fb.back_cell_colors(Point { x: 5, y: 0 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn render_warns_about_invalid_utf8_in_grapheme() {
+        let (_, fb) = render_bytes(&[0xD8, 0x80, 0xFF, b'x']);
+
+        assert_eq!(fb.back_cell_colors(Point::default()), Some(warning_colors(&fb)));
+        assert_ne!(fb.back_cell_colors(Point { x: 1, y: 0 }), Some(warning_colors(&fb)));
+    }
+
+    #[test]
+    fn text_has_distinguishes_invalid_utf8() {
+        let buf = text_buffer(&[0x80, 0xEF, 0xBF, 0xBD]);
+        let is_invalid_utf8 = |ch: char, bytes: &[u8]| {
+            ch == char::REPLACEMENT_CHARACTER && bytes != "\u{fffd}".as_bytes()
+        };
+
+        assert!(buf.text_has(0..1, is_invalid_utf8));
+        assert!(!buf.text_has(1..4, is_invalid_utf8));
     }
 
     #[test]

@@ -115,6 +115,8 @@ pub struct Framebuffer {
     contrast_colors: [Cell<(StraightRgba, StraightRgba)>; CACHE_TABLE_SIZE],
     background_fill: StraightRgba,
     foreground_fill: StraightRgba,
+    /// Bounds the area scanned for internal warning marks.
+    warning_bounds: Rect,
 }
 
 impl Framebuffer {
@@ -133,6 +135,7 @@ impl Framebuffer {
                 CACHE_TABLE_SIZE],
             background_fill: DEFAULT_THEME[IndexedColor::Background as usize],
             foreground_fill: DEFAULT_THEME[IndexedColor::Foreground as usize],
+            warning_bounds: Rect::default(),
         }
     }
 
@@ -190,6 +193,7 @@ impl Framebuffer {
         back.fg_bitmap.fill(self.foreground_fill);
         back.attributes.reset();
         back.cursor = Cursor::new_disabled();
+        self.warning_bounds = Rect::default();
     }
 
     /// Replaces text contents in a single line of the framebuffer.
@@ -411,7 +415,65 @@ impl Framebuffer {
     /// Replaces VT attributes in the given rectangle.
     pub fn replace_attr(&mut self, target: Rect, mask: Attributes, attr: Attributes) {
         let back = &mut self.buffers[self.frame_counter & 1];
-        back.attributes.replace(target, mask, attr);
+        let target = target.intersect(back.attributes.size.as_rect());
+        if target.is_empty() {
+            return;
+        }
+
+        if !self.warning_bounds.intersect(target).is_empty() {
+            back.attributes.replace_preserving(target, mask, attr);
+        } else {
+            back.attributes.replace(target, mask, attr);
+        }
+    }
+
+    /// Marks cells whose colors must be replaced after all other drawing.
+    pub(crate) fn mark_warning(&mut self, target: Rect) {
+        let back = &mut self.buffers[self.frame_counter & 1];
+        let target = target.intersect(back.bg_bitmap.size.as_rect());
+        if target.is_empty() {
+            return;
+        }
+
+        self.warning_bounds = if self.warning_bounds.is_empty() {
+            target
+        } else {
+            Rect {
+                left: self.warning_bounds.left.min(target.left),
+                top: self.warning_bounds.top.min(target.top),
+                right: self.warning_bounds.right.max(target.right),
+                bottom: self.warning_bounds.bottom.max(target.bottom),
+            }
+        };
+        back.attributes.replace(target, Attributes::Warning, Attributes::Warning);
+    }
+
+    /// Applies marked warning colors last and clears the internal marks.
+    pub(crate) fn apply_warning_colors(&mut self) {
+        let bounds = std::mem::take(&mut self.warning_bounds);
+        if bounds.is_empty() {
+            return;
+        }
+
+        let bg = self.indexed(IndexedColor::Yellow);
+        let fg = self.contrasted(bg);
+        let back = &mut self.buffers[self.frame_counter & 1];
+        let width = back.bg_bitmap.size.width as usize;
+
+        // `mark_warning` clips every mark, so these row indices are already in bounds.
+        for y in bounds.top..bounds.bottom {
+            let row = y as usize * width;
+            for x in bounds.left..bounds.right {
+                let index = row + x as usize;
+                if !back.attributes.data[index].is(Attributes::Warning) {
+                    continue;
+                }
+                back.attributes.data[index] =
+                    Attributes(back.attributes.data[index].0 & !Attributes::Warning.0);
+                back.bg_bitmap.data[index] = bg;
+                back.fg_bitmap.data[index] = fg;
+            }
+        }
     }
 
     /// Sets the current visible cursor position and type.
@@ -874,6 +936,8 @@ impl Attributes {
     pub const Underlined: Self = Self(4);
     pub const Strikethrough: Self = Self(8);
     pub const All: Self = Self(16 - 1);
+    // `All` covers terminal attributes. This bit never reaches terminal output.
+    const Warning: Self = Self(16);
 
     pub const fn is(self, attr: Self) -> bool {
         (self.0 & attr.0) == attr.0
@@ -913,10 +977,27 @@ impl AttributeBuffer {
     }
 
     fn replace(&mut self, target: Rect, mask: Attributes, attr: Attributes) {
-        let target = target.intersect(self.size.as_rect());
-        if target.is_empty() {
-            return;
+        if mask == Attributes::All {
+            self.replace_rows(target, |dst| memset(dst, attr));
+        } else {
+            self.replace_preserving(target, mask, attr);
         }
+    }
+
+    fn replace_preserving(&mut self, target: Rect, mask: Attributes, attr: Attributes) {
+        self.replace_rows(target, |dst| {
+            // Preserve internal bits that are outside the caller's mask.
+            for a in dst {
+                *a = Attributes(a.0 & !mask.0 | attr.0);
+            }
+        });
+    }
+
+    fn replace_rows(&mut self, target: Rect, mut replace: impl FnMut(&mut [Attributes])) {
+        // Framebuffer clips and rejects empty targets once before it chooses whether
+        // this operation must preserve internal attributes.
+        debug_assert_eq!(target.intersect(self.size.as_rect()), target);
+        debug_assert!(!target.is_empty());
 
         let top = target.top as usize;
         let bottom = target.bottom as usize;
@@ -927,15 +1008,7 @@ impl AttributeBuffer {
         for y in top..bottom {
             let beg = y * stride + left;
             let end = y * stride + right;
-            let dst = &mut self.data[beg..end];
-
-            if mask == Attributes::All {
-                memset(dst, attr);
-            } else {
-                for a in dst {
-                    *a = Attributes(a.0 & !mask.0 | attr.0);
-                }
-            }
+            replace(&mut self.data[beg..end]);
         }
     }
 
